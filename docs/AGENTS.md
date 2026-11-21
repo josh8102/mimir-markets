@@ -27,6 +27,8 @@ lib/x402/server.ts	x402 v2 seller paywall (@x402/next) + settlement recording
 lib/x402/buyer.ts	x402 v2 buyer with a hard USDC budget cap (@x402/fetch)
 agents/oracle/index.ts	Off-chain AI oracle agent (LLM + local keypair)
 agents/market-creator/index.ts	Autonomous market creator (LLM + local keypair)
+agents/market-creator/drafting.ts	LLM candidate drafting, statement revision review digest binding, and pre-signing verification
+agents/market-creator/dedupe.ts	Candidate signature normalization and post-revision duplicate filtering
 agents/council/	Ten AI personas that stake as economic actors
 fixtures/ledger/	Versioned public-chain captures for deterministic offline replay
 deploy/deploy.ts	Soroban build/deploy/initialize script
@@ -75,6 +77,8 @@ environment behavior.
 | `lib/x402/buyer.ts` | x402 v2 buyer with a hard USDC budget cap (`@x402/fetch`) |
 | `agents/oracle/index.ts` | Off-chain AI oracle agent (LLM + local keypair) |
 | `agents/market-creator/index.ts` | Autonomous market creator (LLM + local keypair) |
+| `agents/market-creator/drafting.ts` | LLM candidate drafting, statement revision review digest binding, and pre-signing verification |
+| `agents/market-creator/dedupe.ts` | Candidate signature normalization and post-revision duplicate filtering |
 | `agents/council/` | Ten AI personas that stake as economic actors |
 | `fixtures/ledger/` | Versioned public-chain captures for deterministic offline replay |
 | `deploy/deploy.ts` | Soroban build/deploy/initialize script |
@@ -322,6 +326,28 @@ https://faucet.circle.com
 Explorer: https://stellar.expert/explorer/testnet
 Public endpoints (rate-limited): https://soroban-testnet.stellar.org and
 https://horizon-testnet.stellar.org
+
+## Market-creator statement revision review
+
+Before the market-creator signs `create_claim` on chain, drafted and deduplicated
+candidates pass through the statement revision review step in
+`agents/market-creator/drafting.ts` and `agents/market-creator/dedupe.ts`:
+
+- **Digest binding** (`reviewStatementRevision`, `computeStatementRevisionDigest`,
+  `buildSourceCommitment`): binds the approved statement wording (`question` and
+  any present `settlementRule`, `creatorPosition`, `counterPosition`), canonical
+  ISO-8601 `deadline`, and resolution `sourceCommitment` (derived from the
+  canonical `resolutionUrl` and optional `sourceText`, or validated when supplied
+  explicitly) into a length-framed SHA-256 digest (`statementDigest`).
+- **Post-revision deduplication** (`reviewDraftedCandidates`,
+  `filterDuplicateCandidates`, `buildCandidateSignature`): drops any candidate whose revised statement
+  collides with an earlier candidate in the batch or an active on-chain claim.
+- **Pre-signing verification** (`verifyStatementForSigning`,
+  `assertStatementApprovedForSigning`, `signApprovedCandidate`): recomputes the
+  statement digest and compares every reviewed field against the approved
+  snapshot before signing. Signing is rejected if any reviewed statement field
+  changed, if the review was not approved, or if the digest is missing or
+  mismatched.
 
 ## Traders
 
