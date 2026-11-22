@@ -435,3 +435,24 @@ that change reviewable:
 - Every new table or index must ship with a `schema_migrations` registration; a
   schema with no registered migration fails `MIGRATION_UNREGISTERED`.
 - Policy: [`docs/SCHEMA_SNAPSHOTS.md`](./SCHEMA_SNAPSHOTS.md).
+
+## Market-creator decision codes
+
+`decideMode()` (`lib/market-creator/mode-matrix.ts`) and
+`evaluateCreatorCandidates()` (`agents/market-creator/drafting.ts`) attach a
+machine-readable `decisionCode` (`CreatorDecisionCode`) to every candidate
+decision so category budget exhaustion is never conflated with source-quality
+rejection:
+
+- `category_budget_exhausted` — category open-market count or USDC exposure cap
+  reached (`limitedBy` / `categoryBudgetLimitedBy` distinguishes `"markets"` vs
+  `"exposure"`).
+- `source_quality_rejected` — candidate failed quality score, resolution URL
+  allowlist, or crypto threshold sanity checks.
+- `exposure_cap_exceeded` — posting the stake would exceed the global USDC
+  open-exposure ceiling (exact equality at the ceiling remains allowed).
+- `duplicate_candidate` — candidate matches an existing or already-admitted
+  signature.
+- `category_disabled` / `category_cap_invalid` — category kill switch or
+  unresolved fail-closed category cap configuration.
+- `approved` / `held_for_review` / `open_duel_invite` — candidate admitted.

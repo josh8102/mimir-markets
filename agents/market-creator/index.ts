@@ -1199,7 +1199,15 @@ async function run(): Promise<void> {
       categoryEnabled: isCategoryEnabled(candidate.category),
     });
     if (!categoryGate.allowed) {
-      console.log(`[market-creator] Per-category cap blocks this candidate — ${categoryGate.blockedBy}`);
+      const decisionCode =
+        categoryGate.reason === "cap_exceeded"
+          ? "category_budget_exhausted"
+          : categoryGate.reason === "category_disabled"
+            ? "category_disabled"
+            : "category_cap_invalid";
+      console.log(
+        `[market-creator] Per-category cap blocks this candidate [${decisionCode}] — ${categoryGate.blockedBy}`,
+      );
       continue;
     }
 
