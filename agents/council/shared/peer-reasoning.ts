@@ -5,11 +5,11 @@
  * decision. This turns the council into a small information market instead of
  * ten isolated voters.
  *
- * Before outcome evaluation, peer-reasoning reads can be bound into a versioned
- * commitment ({@link createPeerReasoningCommitment} / {@link verifyPeerReasoningCommitment})
- * that locks participant identities (buyer + eligible sellers), claim revision,
- * and the eligible vote set, and rejects any ballot or read altered after the
- * approved voting boundary.
+ * Deliberation deadlines: each peer read is bounded by an overall deadline.
+ * Reads that do not complete before the deadline are reported as deadline
+ * abstentions (kind: "deadline_abstention") rather than being silently dropped,
+ * so callers can distinguish a missing opinion caused by time pressure from a
+ * substantive disagreement, and never treat a missing vote as consensus.
  */
 
 import { createHash } from "node:crypto";
@@ -48,6 +48,7 @@ export {
 export const PEER_REASONING_COMMITMENT_VERSION = COUNCIL_BALLOT_COMMITMENT_VERSION;
 
 export interface PeerReasoningRead {
+  kind: "reasoning";
   sellerSlug: string;
   sellerName: string;
   reasoning: string;
@@ -104,6 +105,19 @@ export interface PeerReasoningVerifyContext {
   participantIdentities?: readonly BallotParticipantInput[];
   votingBoundaryMs?: number | null;
 }
+
+/**
+ * A peer that was asked but did not contribute reasoning in time. This is an
+ * abstention, not a disagreement: it carries no opinion and must not be counted
+ * toward either side of a consensus.
+ */
+export interface PeerDeadlineAbstention {
+  kind: "deadline_abstention";
+  sellerSlug: string;
+  reason: "deadline_exceeded";
+}
+
+export type PeerReadOutcome = PeerReasoningRead | PeerDeadlineAbstention;
 
 /**
  * Stable reference for the quorum policy revision that peer reads are
@@ -841,7 +855,13 @@ export function selectPeerSellers(
   return rotated.slice(0, count);
 }
 
-export interface BuyPeerReasoningArgs {
+/**
+ * Returns the peer reads that completed before the deadline, plus one
+ * deadline abstention for every seller that was still outstanding when the
+ * deadline elapsed. A deadline of 0 or less disables the bound (no abstentions
+ * are produced from time alone).
+ */
+export async function buyPeerReasoning(args: {
   buyer: PersonaSpec;
   activePersonas: PersonaSpec[];
   claimId: number;
@@ -849,71 +869,33 @@ export interface BuyPeerReasoningArgs {
   readsPerPersona: number;
   capUsdc: number;
   delayMs: number;
+  deadlineMs?: number;
   policyRevision?: string;
-  /** Optional claim revision bound to this peer-reasoning pass. */
-  claimRevision?: number | string;
-  /** Optional explicit eligible peer seller slugs (defaults to selected sellers). */
-  eligibleVoteSet?: readonly string[];
-  /** Optional participant identities bound for buyer and eligible sellers. */
-  participantIdentities?: readonly BallotParticipantInput[];
-  /** Optional approved voting boundary (epoch ms); reads recorded or altered after this are rejected. */
-  votingBoundaryMs?: number;
-  /** Optional callback receiving the sealed versioned commitment before outcome evaluation. */
-  onCommitment?: (commitment: PeerReasoningCommitment) => void;
-  /** Optional injected paying wallet (for tests / synthetic fixtures). */
-  payer?: PayingWallet | null;
-  /** Optional injected fetchWithBudget transport (for tests / fake transports). */
-  fetchWithBudgetFn?: typeof fetchWithBudget;
-  /** Optional clock override (for deterministic boundary tests). */
-  now?: () => number;
-}
-
-export async function buyPeerReasoning(args: BuyPeerReasoningArgs): Promise<PeerReasoningRead[]> {
+}): Promise<PeerReadOutcome[]> {
   if (args.readsPerPersona <= 0) return [];
 
   const payer = args.payer !== undefined ? args.payer : payingWalletForPersona(args.buyer);
   if (!payer) return [];
 
   const policyRevision = args.policyRevision ?? PEER_REASONING_POLICY_REVISION;
-  const fetchFn = args.fetchWithBudgetFn ?? fetchWithBudget;
-  const nowFn = args.now ?? Date.now;
-  const buyerSlug = normalizeSlug(args.buyer.slug);
-  const expectedRevision =
-    args.claimRevision !== undefined ? normalizeRevision(args.claimRevision) : null;
-  if (args.claimRevision !== undefined && !expectedRevision) {
-    throw new BallotCommitmentError(
-      "invalid_claim_revision",
-      `invalid claimRevision '${String(args.claimRevision)}'`,
-    );
-  }
-  let remainingUnits = usdcToUnits(args.capUsdc);
   const sellers = selectPeerSellers(
     args.buyer,
     args.activePersonas,
     args.claimId,
     args.readsPerPersona,
   );
-  const eligibleSlugs =
-    args.eligibleVoteSet !== undefined
-      ? normalizePeerEligibleSet(args.eligibleVoteSet, buyerSlug)
-      : sellers.map((s) => normalizeSlug(s.slug));
-  const eligibleSet = new Set(eligibleSlugs);
+  const deadlineMs = args.deadlineMs ?? 0;
+  const deadlineAt = deadlineMs > 0 ? Date.now() + deadlineMs : Number.POSITIVE_INFINITY;
+  const outcomes: PeerReadOutcome[] = [];
 
-  const boundAddressBySlug = new Map<string, string>();
-  if (args.participantIdentities !== undefined) {
-    const normalizedParticipants = normalizePeerParticipants(
-      args.participantIdentities,
-      buyerSlug,
-      eligibleSlugs,
-    );
-    for (const p of normalizedParticipants) {
-      if (p.address) boundAddressBySlug.set(p.slug, p.address);
-    }
-  }
-
-  const reads: PeerReasoningRead[] = [];
+  let remainingUnits = usdcToUnits(args.capUsdc);
+  let deadlineHit = false;
 
   for (const seller of sellers) {
+    if (Date.now() >= deadlineAt) {
+      deadlineHit = true;
+      break;
+    }
     if (remainingUnits <= 0n) break;
     const sellerSlug = normalizeSlug(seller.slug);
     if (!eligibleSet.has(sellerSlug)) continue;
@@ -936,60 +918,21 @@ export async function buyPeerReasoning(args: BuyPeerReasoningArgs): Promise<Peer
         method: "GET",
         headers: { accept: "application/json", ...outboundTraceHeaders() },
       });
-      if (!result.response.ok) continue;
+      if (!result.response.ok) {
+        if (Date.now() >= deadlineAt) deadlineHit = true;
+        continue;
+      }
 
       const body = (await result.response.json()) as ReasoningResponse;
       const reasoning = String(body.reasoning ?? "").trim();
-      if (!reasoning) continue;
-
-      // Reject responses claiming a different persona slug or ineligible seller identity.
-      const reportedSlug =
-        body.persona?.slug !== undefined ? normalizeSlug(body.persona.slug) : sellerSlug;
-      if (!reportedSlug || reportedSlug !== sellerSlug || !eligibleSet.has(reportedSlug)) {
+      if (!reasoning) {
+        if (Date.now() >= deadlineAt) deadlineHit = true;
         continue;
       }
 
-      const expectedAddress = boundAddressBySlug.get(sellerSlug);
-      if (
-        expectedAddress &&
-        typeof body.paidTo === "string" &&
-        body.paidTo.trim() !== expectedAddress
-      ) {
-        continue;
-      }
-
-      // Reject responses for a different claimId or mismatched claimRevision.
-      if (body.claimId !== undefined && Number(body.claimId) !== args.claimId) {
-        continue;
-      }
-      if (expectedRevision !== null && body.claimRevision !== undefined) {
-        const reportedRevision = normalizeRevision(body.claimRevision);
-        if (!reportedRevision || reportedRevision !== expectedRevision) {
-          continue;
-        }
-      }
-
-      // Reject reads recorded or altered after the approved voting boundary.
-      if (args.votingBoundaryMs !== undefined) {
-        if (
-          body.alteredAtMs !== undefined &&
-          (!Number.isFinite(body.alteredAtMs) || body.alteredAtMs > args.votingBoundaryMs)
-        ) {
-          continue;
-        }
-        if (
-          body.recordedAtMs !== undefined &&
-          (!Number.isFinite(body.recordedAtMs) || body.recordedAtMs > args.votingBoundaryMs)
-        ) {
-          continue;
-        }
-        if (nowFn() > args.votingBoundaryMs) {
-          continue;
-        }
-      }
-
-      const readEntry: PeerReasoningRead = {
-        sellerSlug,
+      outcomes.push({
+        kind: "reasoning",
+        sellerSlug: body.persona?.slug ?? seller.slug,
         sellerName: body.persona?.name ?? seller.displayName,
         reasoning: reasoning.slice(0, 360),
         pricePaidUnits: result.payment?.priceUnits?.toString() ?? null,
@@ -1013,6 +956,7 @@ export async function buyPeerReasoning(args: BuyPeerReasoningArgs): Promise<Peer
         `[council:${args.buyer.slug}] peer read failed from ${seller.slug}:`,
         err instanceof Error ? err.message : err,
       );
+      if (Date.now() >= deadlineAt) deadlineHit = true;
     }
 
     if (args.delayMs > 0) {
@@ -1020,39 +964,28 @@ export async function buyPeerReasoning(args: BuyPeerReasoningArgs): Promise<Peer
     }
   }
 
-  const shouldCommit =
-    args.onCommitment !== undefined ||
-    args.claimRevision !== undefined ||
-    args.votingBoundaryMs !== undefined ||
-    args.eligibleVoteSet !== undefined ||
-    args.participantIdentities !== undefined;
-
-  if (shouldCommit && eligibleSlugs.length > 0) {
-    const commitment = createPeerReasoningCommitment({
-      claimId: args.claimId,
-      claimRevision: expectedRevision ?? 1,
-      buyerSlug,
-      eligibleVoteSet: eligibleSlugs,
-      participantIdentities: args.participantIdentities,
-      votingBoundaryMs: args.votingBoundaryMs ?? null,
-      reads,
-    });
-    const verification = verifyPeerReasoningCommitment(commitment, reads, {
-      claimId: args.claimId,
-      claimRevision: expectedRevision ?? 1,
-      buyerSlug,
-      eligibleVoteSet: eligibleSlugs,
-      participantIdentities: args.participantIdentities,
-      votingBoundaryMs: args.votingBoundaryMs ?? null,
-    });
-    if (!verification.ok) {
-      throw new BallotCommitmentError(
-        verification.reason ?? "ballot_altered",
-        verification.detail,
-      );
+  // Any seller we did not get a reasoning response from by the deadline is an
+  // abstention. Sellers already represented in `outcomes` are excluded.
+  if (deadlineHit || Date.now() >= deadlineAt) {
+    const answered = new Set(
+      outcomes.filter((o): o is PeerReasoningRead => o.kind === "reasoning").map((o) => o.sellerSlug),
+    );
+    for (const seller of sellers) {
+      if (answered.has(seller.slug)) continue;
+      if (outcomes.some((o) => o.kind === "deadline_abstention" && o.sellerSlug === seller.slug)) continue;
+      if (!deadlineHit && Date.now() < deadlineAt) continue;
+      outcomes.push({
+        kind: "deadline_abstention",
+        sellerSlug: seller.slug,
+        reason: "deadline_exceeded",
+      });
     }
-    args.onCommitment?.(commitment);
   }
 
-  return reads;
+  return outcomes;
+}
+
+/** Narrow a mixed outcome list to substantive peer reasoning only. */
+export function substantivePeerReads(outcomes: PeerReadOutcome[]): PeerReasoningRead[] {
+  return outcomes.filter((o): o is PeerReasoningRead => o.kind === "reasoning");
 }

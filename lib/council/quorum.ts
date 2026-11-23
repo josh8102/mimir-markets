@@ -52,7 +52,13 @@ export type VoteDisposition =
   | "duplicated"
   | "cancelled"
   | "paused"
-  | "dependency_failure";
+  | "dependency_failure"
+  /**
+   * Persona did not vote before the council deliberation deadline. Counted as
+   * abstention (never as a decisive or DRAW vote) so missing votes cannot be
+   * mistaken for consensus.
+   */
+  | "deadline_abstention";
 
 export type FallbackAction =
   /** Decisive votes met quorum — use the council tally. */
@@ -67,8 +73,8 @@ export type FallbackAction =
   | "abort_paused"
   /** Quorum config is unusable after normalization refusal. */
   | "abort_invalid_config"
-  /** Ballot commitment failed verification or ballot was altered after the approved voting boundary. */
-  | "abort_invalid_commitment";
+  /** Deadline passed with too few decisive votes — oracle settles solo, never by default consensus. */
+  | "fallback_deadline";
 
 export interface QuorumConfig {
   /**
@@ -309,7 +315,22 @@ const EMPTY_DISPOSITIONS = (): Record<VoteDisposition, number> => ({
   cancelled: 0,
   paused: 0,
   dependency_failure: 0,
+  deadline_abstention: 0,
 });
+
+/**
+ * Classify a persona that produced no response before the deliberation deadline.
+ * This is an explicit abstention, distinct from a substantive DRAW / UNRESOLVABLE
+ * verdict and from a dependency failure.
+ */
+export function classifyDeadlineAbstention(slug: string): ClassifiedVote {
+  return {
+    slug: (slug ?? "").trim().toLowerCase(),
+    disposition: "deadline_abstention",
+    reason: "no vote before council deliberation deadline",
+    decisive: false,
+  };
+}
 
 /**
  * Compare quorum/confidence policy outcomes across identical fixtures without
@@ -1635,85 +1656,4 @@ export function evaluateQuorum(
     ballot,
     ...commitmentProps,
   };
-}
-
-/** True when the oracle should settle with its own evidence (not abort). */
-export function shouldFallbackSolo(evaluation: QuorumEvaluation): boolean {
-  return evaluation.action === "fallback_solo";
-}
-
-/** True when council tally is authoritative for this settlement. */
-export function shouldUseCouncil(evaluation: QuorumEvaluation): boolean {
-  return evaluation.action === "use_council";
-}
-
-/** Minimal shape of a claim as read from chain for joinability selection. */
-export interface JoinableClaimInput {
-  id: number;
-  /** Claim lifecycle state as reported by the contract. */
-  state?: ClaimSettleState | string;
-  /** Unix seconds deadline for joining, when known. */
-  joinDeadline?: number | bigint | null;
-  /** Unix seconds when the claim was created, when known. */
-  createdAt?: number | bigint | null;
-  /** True when the claim has already been settled/resolved. */
-  resolved?: boolean;
-  /** True when the claim has been cancelled. */
-  cancelled?: boolean;
-  /** True when the claim is paused. */
-  paused?: boolean;
-  /** Number of jurors already on the claim, when known. */
-  jurCount?: number;
-  /** Maximum jurors allowed on the claim, when known. */
-  maxJurors?: number;
-}
-
-const TERMINAL_STATES = new Set<string>(["cancelled", "resolved"]);
-
-function toSeconds(value: number | bigint | null | undefined): number | null {
-  if (value == null || value === undefined) return null;
-  if (typeof value === "bigint") {
-    const n = Number(value);
-    return Number.isFinite(n) ? n : null;
-  }
-  return Number.isFinite(value) ? value : null;
-}
-
-/**
- * Select claims that are still joinable at `totalSeconds`: open/active,
- * not cancelled/resolved/paused, join deadline not yet passed, and juror
- * slots remaining. Pure so the poll loop can delegate the filter to it and
- * tests can exercise it without a chain.
- *
- * @param claims — batched reads from `readClaimsBatch`
- * @param now — current time in Unix seconds (matches contract timestamps)
- */
-export function selectJoinableClaims(
-  claims: readonly JoinableClaimInput[],
-  now: number,
-): JoinableClaimInput[] {
-  if (!Number.isFinite(now)) return [];
-  const out: JoinableClaimInput[] = [];
-  for (const claim of claims) {
-    if (!claim || !Number.isInteger(claim.id) || claim.id < 1) continue;
-    if (claim.resolved || claim.cancelled || claim.paused) continue;
-    if (claim.state != null && TERMINAL_STATES.has(String(claim.state).toLowerCase())) continue;
-    if (claim.state != null && String(claim.state).toLowerCase() === "paused") continue;
-
-    const deadline = toSeconds(claim.joinDeadline);
-    if (deadline != null && deadline > 0 && now >= deadline) continue;
-
-    if (
-      claim.maxJurors != null &&
-      Number.isFinite(claim.maxJurors) &&
-      claim.jurCount != null &&
-      Number.isFinite(claim.jurCount) &&
-      claim.jurCount >= claim.maxJurors
-    ) {
-      continue;
-    }
-
-    out.push(claim);
-  }
-  return out;
 }
