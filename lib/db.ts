@@ -8,6 +8,9 @@ import type { AgentTradeRow } from "@/lib/agents/performance";
 import type { AgentRecord } from "@/lib/agents/registry";
 import type { SpendPermissionRecord } from "@/lib/agents/spend-permissions";
 import type { CopyAuditRecord, CopyPermission } from "@/lib/copy-trading";
+import { buildProposalBacklogTriage, type ProposalBacklogTriageExport } from "./ops/proposal-triage";
+
+export type { ProposalBacklogTriageExport };
 
 /**
  * ADDRESS INVARIANT — read before touching any statement below.

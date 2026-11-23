@@ -18,88 +18,41 @@ import { isValidBps } from "./money";
  * This means a captured basket-creation signature cannot be replayed to
  * insert duplicate baskets.
  */
-export class BasketValidationError extends Error {
-  constructor(
-    message: string,
-    public readonly agentId?: string,
-    public readonly weights?: number[],
-  ) {
-    super(message);
-    this.name = "BasketValidationError";
+/**
+ * Deterministic composition revision (#892).
+ *
+ * A stable hash over the canonicalized member set (agentId ascending,
+ * tie-broken by weightBps). Two baskets with the same members in different
+ * input orders yield the same revision; any change to membership or weights
+ * yields a different revision. Uses DJB2 over the canonical string — small,
+ * dependency-free, and stable across hosts. Not a cryptographic hash: this
+ * is an equality check on an in-process value, not a security primitive.
+ */
+export function compositionRevision(
+  members: readonly { agentId: string; weightBps: number }[],
+): string {
+  const canonical = canonicalizeMembers(members);
+  let hash = 5381;
+  for (const member of canonical) {
+    const chunk = `${member.agentId}:${member.weightBps};`;
+    for (let i = 0; i < chunk.length; i++) {
+      hash = ((hash * 33) ^ chunk.charCodeAt(i)) >>> 0;
+    }
   }
-}
-
-export interface BasketMember {
-  agentId: string;
-  weightBps: number;
+  return `c${hash.toString(16).padStart(8, "0")}`;
 }
 
 /**
- * Reject duplicate members carrying conflicting weights (#894).
- *
- * A basket composition is valid iff every agentId appears at most once, OR
- * appears multiple times with the *identical* weight (which collapses to a
- * single entry — the deterministic canonical form).
- *
- * Deterministic and side-effect free: the error names the offending agentId
- * and the conflicting weights, but no timestamps, orderings, or host data.
+ * True when a suggestion was built from a different composition than the
+ * one currently in force. Callers use this to reject a stale reviewed action
+ * before applying it, so new weights never silently override old consent.
  */
-export function validateBasketComposition(members: readonly BasketMember[]): void {
-  const byAgent = new Map<string, number[]>();
-  for (const member of members) {
-    if (typeof member.agentId !== "string" || member.agentId.length === 0) {
-      throw new BasketValidationError("basket member has empty agentId");
-    }
-    if (!Number.isInteger(member.weightBps) || member.weightBps <= 0) {
-      throw new BasketValidationError(
-        "basket member weightBps must be a positive integer",
-        member.agentId,
-        [member.weightBps],
-      );
-    }
-    const weights = byAgent.get(member.agentId) ?? [];
-    weights.push(member.weightBps);
-    byAgent.set(member.agentId, weights);
-  }
-  for (const [agentId, weights] of byAgent) {
-    if (weights.length > 1 && new Set(weights).size > 1) {
-      throw new BasketValidationError(
-        `duplicate basket member ${agentId} carries conflicting weights: ${weights.join(", ")}`,
-        agentId,
-        weights.slice(),
-      );
-    }
-  }
-}
-
-/**
- * Return the canonical member ordering, collapsing identical-weight duplicates.
- *
- * Sort key: agentId ascending; tie-break by weightBps ascending. Two baskets
- * with the same members produce byte-identical canonical arrays regardless of
- * input order. Call ONLY after validateBasketComposition() has passed.
- */
-export function canonicalizeMembers(members: readonly BasketMember[]): BasketMember[] {
-  const byAgent = new Map<string, number>();
-  for (const member of members) {
-    const existing = byAgent.get(member.agentId);
-    if (existing === undefined) {
-      byAgent.set(member.agentId, member.weightBps);
-    } else if (existing !== member.weightBps) {
-      // Defensive: validateBasketComposition should have rejected this.
-      throw new BasketValidationError(
-        `canonicalizeMembers received conflicting weights for ${member.agentId}`,
-        member.agentId,
-        [existing, member.weightBps],
-      );
-    }
-  }
-  return [...byAgent.entries()]
-    .map(([agentId, weightBps]) => ({ agentId, weightBps }))
-    .sort((a, b) => {
-      if (a.agentId !== b.agentId) return a.agentId < b.agentId ? -1 : 1;
-      return a.weightBps - b.weightBps;
-    });
+export function isSuggestionStale(
+  suggestion: { compositionRevision?: string },
+  currentMembers: readonly { agentId: string; weightBps: number }[],
+): boolean {
+  if (!suggestion.compositionRevision) return false;
+  return suggestion.compositionRevision !== compositionRevision(currentMembers);
 }
 
 export function basketMessage(args: {

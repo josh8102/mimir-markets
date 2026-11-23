@@ -37,6 +37,7 @@ deploy/contract-artifacts.manifest.json	Pinned Wasm digests for fail-closed prov
 lib/ops/artifact-provenance.ts	Offline SHA-256 artifact provenance verifier
 lib/ops/cache-backup.ts	Offline read-index cache-backup verifier (checksum + privacy, no network)
 lib/ops/dependency-audit.ts	Fail-closed npm audit triage (production high/critical, privacy-safe)
+lib/ops/proposal-triage.ts	Operator proposal backlog triage export (grouped by age & blocking reason, privacy-safe)
 lib/server/read-index-backup.ts	DB-backed read-index dump / verified restore (restore fingerprint check)
 scripts/verify-artifact-provenance.ts	CLI: verify or --write-pins contract artifacts
 scripts/verify-cache-backup.ts	CLI: offline cache-backup verification (npm run verify:cache-backup)
@@ -273,6 +274,10 @@ a dependency, runtime, or runner change therefore misses the cache. Use
 `--no-cache` for a forced cold run and `--clear-cache` before diagnosing a
 cache problem. CI caches the same directory, but the manifest and versioned
 path prevent stale entries from being trusted.
+
+Before discovering tests or creating a cache, the runner checks the Node version
+against the `engines.node` range in `package.json`. If the version is unsupported,
+run `nvm install` and `nvm use` in the repository root, then retry.
 
 The runner uses a strict child-environment allowlist. It does not load
 `.env.local` and does not pass production seeds, Stellar credentials, LLM keys,

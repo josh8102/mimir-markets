@@ -7,6 +7,18 @@
  */
 
 import { extractUsdThresholds, cryptoThresholdReason } from "./thresholds.js";
+import { buildCandidateSignature } from "./dedupe.js";
+import {
+  bumpCategoryUsage,
+  checkCategoryCreatorCap,
+  normalizeCategory,
+  type CategoryCapPolicy,
+  type CategoryExposureBucket,
+} from "../../lib/market-creator/category-caps.js";
+import { checkCreatorExposureCap } from "../../lib/market-creator/exposure-caps.js";
+import type { CreatorDecisionCode } from "../../lib/market-creator/mode-matrix.js";
+
+export type { CreatorDecisionCode };
 
 export type DeadlineRejectionReason =
   | "empty_deadline"
